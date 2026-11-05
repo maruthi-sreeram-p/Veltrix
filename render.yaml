@@ -1,0 +1,198 @@
+# =============================================================================
+# CareerFlux — Render Blueprint (pilot)
+#
+# Three resources: a managed PostgreSQL, the backend, and the nginx frontend.
+# The browser talks to one origin either way — nginx serves the app and proxies
+# `/api` — so the frontend needs no API-URL mechanism and no cross-origin call.
+#
+# THE BACKEND IS A PUBLIC WEB SERVICE HERE, because Render's free tier has no
+# private services. That is the shape the pilot is actually deployed in. It
+# costs one thing: the backend has an address of its own, so `/actuator/health`
+# and `/actuator/info` are reachable from the internet. Both are already
+# `permitAll` and `show-details: when-authorized` means neither describes the
+# infrastructure; everything else on the backend still requires a token.
+#
+# On a paid plan, change `type: web` to `type: pserv` for the backend and point
+# the frontend at its internal address (`careerflux-backend:8080`, scheme
+# `http://`). Nothing else changes — that is what CAREERFLUX_BACKEND_ORIGIN is
+# for.
+#
+# WHAT THIS FILE DOES NOT DO
+#
+# It contains no secrets. Everything sensitive is `sync: false`, which tells
+# Render to ask for the value in the dashboard instead of reading it from here.
+# Nothing in this repository ever holds a real credential.
+#
+# BEFORE YOU TRUST IT
+#
+# This blueprint has not been validated against Render's own parser — it was
+# written from the repository, not from a live account. Plan names and region
+# identifiers change; check them against your dashboard on first import. If the
+# import complains, docs/DEPLOYMENT.md has the equivalent manual steps, and
+# those are the authoritative version.
+# =============================================================================
+
+databases:
+  - name: careerflux-db
+    databaseName: careerflux
+    user: careerflux
+    # Singapore is Render's closest region to the colleges this serves. Every
+    # resource below must sit in the SAME region or the private network between
+    # them does not exist.
+    region: singapore
+    # Not `free`: a free database expires, and a pilot holding a college's
+    # placement records must not.
+    plan: basic-256mb
+
+services:
+  # ---------------------------------------------------------------- backend
+  # `web`, not `pserv`: private services are not available on the free tier.
+  # See the note at the top of this file for what that costs and how to change
+  # it on a paid plan.
+  - type: web
+    name: careerflux-backend
+    runtime: docker
+    repo: https://github.com/maruthi-sreeram-p/careerFlux
+    region: singapore
+    # A disk pins the service to one instance, which is exactly what this pilot
+    # wants: the rate limiter counts in this JVM's memory and the schedulers
+    # assume a single runner.
+    plan: starter
+    # One instance, declared rather than implied by the disk (Decision 11).
+    # Nothing yet claims work across instances, so a second one needs the
+    # limiter, the schedulers and the outbox made safe first, not just this
+    # number raised. Field name to be checked on first import, like the rest
+    # of this file.
+    numInstances: 1
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /actuator/health
+
+    disk:
+      name: careerflux-resumes
+      # Must match CAREERFLUX_RESUME_DIR exactly. Without this, uploaded
+      # resumes live on the container filesystem and disappear on the next
+      # deploy while their database rows survive — a student's own CV failing
+      # to open, with nothing in the logs to explain it.
+      mountPath: /app/data/resumes
+      sizeGB: 10
+
+    envVars:
+      # `prod` names this as a real deployment and brings `postgres` with it.
+      # Without any profile the application now refuses to start (it used to
+      # fall back to `dev`), and under `prod` it refuses to start until the
+      # secret, database and origins below are real values.
+      - key: SPRING_PROFILES_ACTIVE
+        value: prod
+      - key: SERVER_PORT
+        value: 8080
+
+      # Named, not inherited. The default resolves relative to the container's
+      # working directory, and a future WORKDIR change would move resumes off
+      # the mounted disk without any error.
+      - key: CAREERFLUX_RESUME_DIR
+        value: /app/data/resumes
+
+      # Every request arrives through the frontend nginx, which OVERWRITES
+      # X-Forwarded-For with the peer address rather than appending to it, so a
+      # caller cannot put an address of their own choosing in front of it.
+      #
+      # KNOWN GAP: that holds only while nginx is the one way in. As a public
+      # `web` service the backend also answers directly, and a direct caller
+      # may be able to choose its own X-Forwarded-For (whether Render's edge
+      # overwrites it is unverified), which the sign-in limiter would then
+      # trust. Closing it is network-boundary work: a private service, or a
+      # backend that refuses traffic not sent through the proxy.
+      - key: CAREERFLUX_FORWARD_HEADERS
+        value: framework
+
+      # Off for the pilot. Ingestion, stale-job expiry, the nightly recompute,
+      # source health checks and the outbox dispatcher all stay stopped until
+      # the college asks for market postings.
+      - key: CAREERFLUX_INGESTION_SCHEDULER_ENABLED
+        value: 'false'
+
+      # Demo *data* and demo *accounts* are separate switches. Neither belongs
+      # on a college's instance.
+      - key: CAREERFLUX_DEMO_SEED_SAMPLE_JOBS
+        value: 'false'
+      - key: CAREERFLUX_DEMO_ALLOW_SEEDING_INTO_POPULATED_CORPUS
+        value: 'false'
+
+      # ---- values you supply in the dashboard -----------------------------
+      # Render shows the database's internal connection details on its own
+      # page. Build the JDBC form by hand: jdbc:postgresql://HOST:PORT/careerflux
+      # Spring does not understand Render's postgresql:// URL as-is.
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_USERNAME
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+
+      # openssl rand -base64 48
+      # The built-in fallback is published in this repository and the
+      # application refuses it outside dev and test, so a missing value fails
+      # the deploy rather than silently signing real sessions with a public key.
+      - key: CAREERFLUX_JWT_SECRET
+        sync: false
+
+      # The frontend's public Render URL, exactly as people type it, e.g.
+      # https://careerflux-frontend.onrender.com — no trailing slash.
+      #
+      # Required even though the browser only ever sees one origin. A browser
+      # sends `Origin` on any non-GET request, same-origin included, and nginx
+      # forwards it unchanged; Spring checks it against this list. Get it wrong
+      # and every read works while every write fails with a bare
+      # "Invalid CORS request" — which looks like a broken app, not a setting.
+      - key: CAREERFLUX_CORS_ORIGINS
+        sync: false
+
+      # Optional. Absent means resume parsing and match narratives use their
+      # deterministic fallbacks — a supported mode, not a fault.
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # First boot only, to create the platform operator. Clear them afterwards
+      # so a restart does not keep the password in the service environment.
+      - key: CAREERFLUX_ADMIN_EMAIL
+        sync: false
+      - key: CAREERFLUX_ADMIN_PASSWORD
+        sync: false
+
+  # --------------------------------------------------------------- frontend
+  - type: web
+    name: careerflux-frontend
+    runtime: docker
+    repo: https://github.com/maruthi-sreeram-p/careerFlux
+    region: singapore
+    plan: starter
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    healthCheckPath: /healthz
+
+    envVars:
+      # Where the backend is, INCLUDING the scheme. Render's edge serves the
+      # backend only over HTTPS and answers plain HTTP with a redirect, so the
+      # scheme is not optional here — it is what stops the request bouncing.
+      - key: CAREERFLUX_BACKEND_ORIGIN
+        value: https://careerflux.onrender.com
+
+      # The Host header to address the backend by, and the single most
+      # load-bearing value in this file. Render's shared edge routes on Host:
+      # leave this as the browser's host and the edge hands the request back to
+      # THIS service, which loops until the browser reports
+      # ERR_TOO_MANY_REDIRECTS with nothing in any log to explain it.
+      - key: CAREERFLUX_BACKEND_HOST
+        value: careerflux.onrender.com
+
+      # The scheme the BROWSER used. TLS terminates at Render's edge, so this
+      # container sees plain HTTP and `$scheme` would tell the backend the
+      # session was never encrypted.
+      - key: CAREERFLUX_FORWARDED_PROTO
+        value: https
+
+      # Render's default port for a web service. nginx listens here instead of
+      # 80; see frontend/nginx.conf.
+      - key: CAREERFLUX_LISTEN_PORT
+        value: '10000'
