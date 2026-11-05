@@ -1,0 +1,271 @@
+# ---------------------------------------------------------------------------
+# CareerFlux - base configuration
+#
+# Secrets are never stored here. Everything sensitive is read from the
+# environment; see .env.example at the repository root for the full list.
+# ---------------------------------------------------------------------------
+spring:
+  application:
+    name: careerflux
+  lifecycle:
+    # How long in-flight work has to finish once shutdown begins. Candidate
+    # job search is the longest request the system serves.
+    timeout-per-shutdown-phase: 25s
+  profiles:
+    # No default. Starting without a named profile used to mean `dev` (an H2
+    # file database, the published JWT secret and an open database console), and
+    # a deployment that forgot SPRING_PROFILES_ACTIVE ran like that without a
+    # word. DeploymentProfileGuard now refuses to start instead.
+    #
+    # `prod` is the profile a real deployment runs under. It brings `postgres`
+    # with it, and the guard refuses it alongside dev, test or demo, or without
+    # its secret, database and origins.
+    group:
+      prod: postgres
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema. Hibernate never generates or mutates DDL.
+      ddl-auto: none
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        default_batch_fetch_size: 32
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  servlet:
+    multipart:
+      max-file-size: 8MB
+      max-request-size: 10MB
+  jackson:
+    # Nulls are serialised rather than omitted. The API contract says a field is
+    # nullable; dropping it instead turns "not stated" into `undefined` on the
+    # client, which is a different thing and a reliable source of crashes.
+    default-property-inclusion: always
+    serialization:
+      write-dates-as-timestamps: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: careerflux-ingestion
+      auto-offset-reset: earliest
+    producer:
+      acks: all
+      retries: 3
+  ai:
+    # One attempt per provider call, no silent retries inside the client.
+    #
+    # Spring AI can retry a failed call for minutes on its own. A retry there
+    # happens after the consent gate has already said yes, so a user who
+    # withdrew AI consent during that window would still be sent. With retries
+    # left to the application, every attempt goes back through
+    # AiProcessingPolicy first.
+    retry:
+      max-attempts: 1
+    model:
+      # Pinned off by default so the application boots without an API key.
+      # AiEnablementEnvironmentPostProcessor flips this to `google-genai`
+      # automatically when GEMINI_API_KEY is present in the environment.
+      chat: none
+      embedding: none
+    google:
+      genai:
+        api-key: ${GEMINI_API_KEY:}
+        chat:
+          options:
+            model: ${CAREERFLUX_AI_MODEL:gemini-flash-latest}
+            temperature: 0.2
+
+server:
+  port: ${SERVER_PORT:8081}
+  # Whether to believe X-Forwarded-* when working out the client's address and
+  # scheme.
+  #
+  # `none` by default, which is the safe answer for a backend a client can reach
+  # directly: the header is written by whoever sent the request, so trusting it
+  # unconditionally would let one attacker present a fresh address per request
+  # and walk straight past the sign-in rate limiter.
+  #
+  # Set to `framework` only when every route to this application passes through
+  # a proxy that OVERWRITES the header rather than appending to it. The pilot's
+  # nginx does exactly that, and the pilot compose overlay sets this.
+  forward-headers-strategy: ${CAREERFLUX_FORWARD_HEADERS:none}
+  # Finish what is already in flight before the port closes. Without this a
+  # container stop or a rolling deploy severs requests mid-response — which for
+  # a user means a half-written profile change and no way to
+  # tell whether it was recorded.
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+  compression:
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+      # Only the platform operator sees component detail. With no roles listed,
+      # "authorized" meant anyone signed in, users included.
+      roles: ADMIN
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+careerflux:
+  security:
+    jwt:
+      # Dev-only fallback, and it is published in this repository — a token
+      # signed with it can be forged by anyone who can read the source. The
+      # application refuses to start with this value under any profile other
+      # than dev or test; see JwtService. It was previously accepted anywhere,
+      # because only its length was checked.
+      #
+      # Generate a real one with: openssl rand -base64 48
+      secret: ${CAREERFLUX_JWT_SECRET:dev-only-insecure-secret-change-me-0123456789abcdef}
+      access-token-ttl: PT2H
+      refresh-token-ttl: P14D
+    cors:
+      allowed-origins: ${CAREERFLUX_CORS_ORIGINS:http://localhost:5174,http://127.0.0.1:5174}
+  storage:
+    resume-dir: ${CAREERFLUX_RESUME_DIR:./data/resumes}
+  rate-limit:
+    # Ceilings on abuse, not on use. Every value sits well above what the
+    # busiest user does in a morning, so reaching one is evidence
+    # of a script rather than of a person.
+    #
+    # Counted in this JVM's memory. That is exactly right while the deployment
+    # runs one backend instance and silently wrong the moment it runs two --
+    # see RateLimiter for what changes and what would have to replace it.
+    enabled: ${CAREERFLUX_RATE_LIMIT_ENABLED:true}
+    # Bounds the map. Only the sign-in key is attacker-controlled; the rest are
+    # bounded by the number of accounts.
+    max-tracked-keys: 50000
+
+    # Sign-in, per client address and login identity. BCrypt at cost 12 makes
+    # each attempt about a quarter-second of CPU, so this bounds guessing and
+    # machine load at the same time.
+    login-attempts: 10
+    login-window: PT5M
+
+    # Sign-in, per login identity from ANY address. The ceiling above cannot
+    # stop guesses against one account spread across many addresses -- and on
+    # a deployment that believes X-Forwarded-For the address is the caller's to
+    # choose. Looser than the per-address ceiling so a person mistyping their
+    # own password is not locked out; the accepted cost is that an attacker can
+    # make one account wait out this window.
+    login-account-attempts: 20
+    login-account-window: PT15M
+
+    # Resume upload, per account. Bounds 8 MB files arriving on disk. AI
+    # extraction has its own daily quota and is not duplicated here.
+    resume-uploads: 10
+    resume-upload-window: PT1H
+  # Master switch for every scheduled worker, enforced by BackgroundWorkGate.
+  #
+  # true  (default) - workers run, subject to ingestion.scheduler-enabled for the
+  #                   ingestion and source-traffic subset.
+  # false           - nothing scheduled runs and nothing scheduled writes. This
+  #                   is the setting for a genuine freeze: it also stops the
+  #                   rematch queue, stalled-run recovery, and the pipeline-event
+  #                   and health-history retention sweeps, all of which used to
+  #                   run regardless of scheduler-enabled.
+  #
+  # Left at the default here so behaviour is unchanged from before the switch
+  # existed. A pilot that must not move at all should set this to false.
+  background-work-enabled: true
+  # User data retention. Product and engineering policy values chosen for the
+  # pilot, not statements of what any law requires. Changing them is a
+  # configuration change. See RetentionProperties.
+  retention:
+    # TRUE UNTIL VERIFIED. The nightly run reports what it would remove and
+    # removes nothing: no extracted text, no resume versions, no orphan files and
+    # no due erasures. Set to false only after checking every value below against
+    # this deployment. A user deleting their own resume does not wait for it.
+    dry-run: ${CAREERFLUX_RETENTION_DRY_RUN:true}
+    # Extracted resume text is removed as soon as the proposal read from it is
+    # answered; this is the most it is kept when that never happens.
+    extracted-text-max-age: P30D
+    # The active resume is always kept, plus this many superseded versions.
+    superseded-resume-versions-kept: 2
+    # How long an erasure request can be cancelled before it is carried out.
+    erasure-grace-period: P30D
+    # An unreferenced file must be this old before it counts as orphaned, so an
+    # upload that is still being written is never swept.
+    orphan-file-min-age: PT24H
+    batch-size: 200
+    cron: "0 20 2 * * *"
+    # Backups are NOT covered here. A deletion or erasure removes data from the
+    # live database and resume store; copies inside a backup window remain until
+    # that backup expires, and restoring one brings them back. The Compose backup
+    # script keeps 14 days (CAREERFLUX_BACKUP_KEEP_DAYS). Render's database and
+    # disk backup retention is set on the Render plan and must be recorded by
+    # operations; it is not configured or assumed by this application.
+  consent:
+    # Which notice version is current per purpose, naming a file under
+    # resources/notices/<purpose>/<version>.md. The shipped versions are
+    # engineering placeholders, not approved wording.
+    notice-versions:
+      PRIVACY_NOTICE: engineering-placeholder-1
+      RESUME_PROCESSING: engineering-placeholder-1
+      AI_PROCESSING: engineering-placeholder-1
+    # When a newer notice becomes current, consent to an older one stops counting
+    # until the user agrees to the new text.
+    require-current-notice-version: true
+  ingestion:
+    # The in-process bus is the default transport. Run with the `kafka` profile
+    # to route the exact same pipeline events through Spring Kafka instead.
+    transport: in-process
+    # PAUSED during rules-2 validation.
+    #
+    # Newly ingested postings are classified by the current code, so leaving the
+    # scheduler running while the stored corpus is still rules-1 lets the two
+    # drift apart mid-audit. Nothing is deleted and no source is touched; only
+    # scheduled execution stops.
+    #
+    # This flag gates scheduled ingestion, stale-job expiry, the nightly match
+    # recompute, source health checks and the outbox dispatcher. Queued rematches
+    # are unaffected and still drain, along with the two retention sweeps -- see
+    # careerflux.background-work-enabled below for the switch that stops those.
+    #
+    # Set back to true once the classifier is approved and the corpus backfilled.
+    scheduler-enabled: false
+    max-jobs-per-run: 200
+  sources:
+    user-agent: "CareerFluxBot/0.1 (+https://careerflux.local/bot; contact=ops@careerflux.local)"
+    request-timeout: PT20S
+    default-rate-limit-per-minute: 20
+    health-check-interval: PT6H
+  demo:
+    # Sample job data is never inserted unless asked for here. The `demo`
+    # profile enables demo *accounts*; this enables demo *data*. Conflating the
+    # two once added fixture postings to a corpus of real ones.
+    seed-sample-jobs: false
+    allow-seeding-into-populated-corpus: false
+
+  matching:
+    # Thresholds drive notification routing; see docs/architecture.md.
+    hidden-below: 70
+    digest-min: 75
+    high-priority-min: 85
+    immediate-min: 95
+
+logging:
+  level:
+    com.careerflux: INFO
+    org.hibernate.SQL: WARN
+  # [correlationId] on every line, from CorrelationIdFilter for HTTP requests and
+  # from the run's own id for ingestion. Empty brackets simply mean the work was
+  # not started by either -- startup, for instance -- rather than a lost id.
+  pattern:
+    console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr(%5p) %clr([%X{correlationId:-}]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n%wEx"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p [%X{correlationId:-}] %-40.40logger{39} : %m%n%wEx"
